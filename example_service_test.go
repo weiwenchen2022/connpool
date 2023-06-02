@@ -5,6 +5,7 @@
 package connpool_test
 
 import (
+	"bufio"
 	"bytes"
 	"context"
 	"flag"
@@ -24,6 +25,7 @@ import (
 type MyConn struct {
 	net.Conn
 
+	*bufio.ReadWriter
 	Err error
 }
 
@@ -32,15 +34,24 @@ func (c *MyConn) Write(b []byte) (n int, err error) {
 		return 0, c.Err
 	}
 
-	if !bytes.HasSuffix(b, []byte("\n")) {
-		b = append(b[:len(b):len(b)], "\n"...)
+	if _, err := c.ReadWriter.Write(b); err != nil {
+		c.Err = err
+		return 0, err
 	}
 
-	n, err = c.Conn.Write(b)
-	if err != nil {
-		c.Err = err
+	if !bytes.HasSuffix(b, []byte("\n")) {
+		if err := c.WriteByte('\n'); err != nil {
+			c.Err = err
+			return 0, err
+		}
 	}
-	return n, err
+
+	if err := c.Flush(); err != nil {
+		c.Err = err
+		return 0, err
+	}
+
+	return len(b), nil
 }
 
 func (c *MyConn) Read(b []byte) (n int, err error) {
@@ -48,7 +59,7 @@ func (c *MyConn) Read(b []byte) (n int, err error) {
 		return 0, c.Err
 	}
 
-	n, err = c.Conn.Read(b)
+	n, err = c.ReadWriter.Read(b)
 	if err != nil {
 		c.Err = err
 	}
@@ -60,16 +71,23 @@ func (c *MyConn) Ping(ctx context.Context) error {
 		return c.Err
 	}
 
-	if _, err := c.Conn.Write([]byte("Ping\n")); err != nil {
+	if _, err := c.WriteString("Ping\n"); err != nil {
+		c.Err = err
+		return err
+	}
+	if err := c.Flush(); err != nil {
 		c.Err = err
 		return err
 	}
 
-	var b [256]byte
-	if n, err := c.Conn.Read(b[:]); err != nil {
+	resp, err := c.ReadString('\n')
+	if err != nil {
 		c.Err = err
 		return err
-	} else if strings.Trim(string(b[:n]), "\n") != "Pong" {
+	}
+
+	resp = strings.Trim(resp, "\n")
+	if resp != "Pong" {
 		c.Err = net.ErrClosed
 		return c.Err
 	}
@@ -85,12 +103,15 @@ func Example_openPoolService() {
 	log.SetFlags(log.Lshortfile | log.Ltime | log.Lmicroseconds)
 
 	connpool.Register("dialer-name", dialer.DialerFunc(func(network, address string) (net.Conn, error) {
-		conn, err := net.Dial(network, address)
+		c, err := net.Dial(network, address)
 		if err != nil {
 			return nil, err
 		}
 
-		return &MyConn{Conn: conn}, nil
+		return &MyConn{
+			Conn:       c,
+			ReadWriter: bufio.NewReadWriter(bufio.NewReader(c), bufio.NewWriter(c)),
+		}, nil
 	}))
 
 	address := flag.String("address", os.Getenv("ADDRESS"), "connection address")
@@ -149,19 +170,22 @@ func (s *Service) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		}
 		defer conn.Close()
 
-		if _, err := conn.Write([]byte("\n")); err != nil {
+		if _, err := conn.Write([]byte("")); err != nil {
 			http.Error(w, err.Error(), http.StatusInternalServerError)
 			return
 		}
 
-		var b [256]byte
-		n, err := conn.Read(b[:])
+		var resp string
+		err = conn.Raw(func(dc any) error {
+			resp, err = dc.(*MyConn).ReadString('\n')
+			return err
+		})
 		if err != nil {
 			http.Error(w, err.Error(), http.StatusInternalServerError)
 			return
 		}
 
-		_, _ = io.WriteString(w, string(b[:n]))
+		_, _ = io.WriteString(w, resp)
 		return
 	}
 }

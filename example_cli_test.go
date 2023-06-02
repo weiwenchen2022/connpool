@@ -5,6 +5,7 @@
 package connpool_test
 
 import (
+	"bufio"
 	"bytes"
 	"context"
 	"flag"
@@ -24,6 +25,8 @@ var pool *connpool.Pool // connection pool.
 type Conn struct {
 	net.Conn
 
+	*bufio.ReadWriter
+
 	Err error
 }
 
@@ -32,16 +35,23 @@ func (c *Conn) Ping(ctx context.Context) error {
 		return c.Err
 	}
 
-	if _, err := c.Conn.Write([]byte("Ping\n")); err != nil {
+	if _, err := c.WriteString("Ping\n"); err != nil {
+		c.Err = err
+		return err
+	}
+	if err := c.Flush(); err != nil {
 		c.Err = err
 		return err
 	}
 
-	var b [256]byte
-	if n, err := c.Conn.Read(b[:]); err != nil {
+	resp, err := c.ReadString('\n')
+	if err != nil {
 		c.Err = err
 		return err
-	} else if strings.Trim(string(b[:n]), "\n") != "Pong" {
+	}
+
+	resp = strings.Trim(resp, "\n")
+	if resp != "Pong" {
 		c.Err = net.ErrClosed
 		return net.ErrClosed
 	}
@@ -54,15 +64,24 @@ func (c *Conn) Write(b []byte) (n int, err error) {
 		return 0, c.Err
 	}
 
-	if !bytes.HasSuffix(b, []byte("\n")) {
-		b = append(b[:len(b):len(b)], "\n"...)
+	if _, err := c.ReadWriter.Write(b); err != nil {
+		c.Err = err
+		return 0, err
 	}
 
-	n, err = c.Conn.Write(b)
-	if err != nil {
-		c.Err = err
+	if !bytes.HasSuffix(b, []byte("\n")) {
+		if err := c.WriteByte('\n'); err != nil {
+			c.Err = err
+			return 0, err
+		}
 	}
-	return n, err
+
+	if err := c.Flush(); err != nil {
+		c.Err = err
+		return 0, err
+	}
+
+	return len(b), nil
 }
 
 func (c *Conn) Read(b []byte) (n int, err error) {
@@ -70,7 +89,7 @@ func (c *Conn) Read(b []byte) (n int, err error) {
 		return 0, c.Err
 	}
 
-	n, err = c.Conn.Read(b)
+	n, err = c.ReadWriter.Read(b)
 	if err != nil {
 		c.Err = err
 	}
@@ -85,12 +104,15 @@ func Example_openPoolCLI() {
 	log.SetFlags(log.Lshortfile | log.Ltime | log.Lmicroseconds)
 
 	connpool.Register("dialer-name", dialer.DialerFunc(func(network, address string) (net.Conn, error) {
-		conn, err := net.Dial(network, address)
+		c, err := net.Dial(network, address)
 		if err != nil {
 			return nil, err
 		}
 
-		return &Conn{Conn: conn}, nil
+		return &Conn{
+			Conn:       c,
+			ReadWriter: bufio.NewReadWriter(bufio.NewReader(c), bufio.NewWriter(c)),
+		}, nil
 	}))
 
 	interval := flag.Duration("interval", 1*time.Second, "poll interval")
@@ -144,7 +166,7 @@ func Ping(ctx context.Context) {
 // Query the server for the information requested and prints the results.
 // If the query fails exit the program with an error.
 func Query(ctx context.Context, d time.Duration) {
-	ctx, cancel := context.WithTimeout(ctx, 60*time.Second)
+	ctx, cancel := context.WithTimeout(ctx, 10*time.Second)
 	defer cancel()
 
 	conn, err := pool.Conn(ctx)
@@ -160,7 +182,6 @@ func Query(ctx context.Context, d time.Duration) {
 	ticker := time.NewTicker(d)
 	defer ticker.Stop()
 
-	var b [256]byte
 	for {
 		if conn == nil {
 			select {
@@ -181,14 +202,19 @@ func Query(ctx context.Context, d time.Duration) {
 		case <-ctx.Done():
 			return
 		case <-ticker.C:
-			if _, err := conn.Write([]byte("\n")); err != nil {
+			if _, err := conn.Write([]byte("")); err != nil {
 				log.Println("unable to execute query", err)
 				conn.Close()
 				conn = nil
 				continue
 			}
 
-			n, err := conn.Read(b[:])
+			var resp string
+			var err error
+			err = conn.Raw(func(dc any) error {
+				resp, err = dc.(*Conn).ReadString('\n')
+				return err
+			})
 			if err != nil {
 				log.Println("unable to execute query", err)
 				conn.Close()
@@ -196,7 +222,7 @@ func Query(ctx context.Context, d time.Duration) {
 				continue
 			}
 
-			log.Printf("cur time %s", b[:n])
+			log.Printf("cur time %s", resp)
 		}
 	}
 }
