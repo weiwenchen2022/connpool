@@ -81,7 +81,7 @@ func (c *MyConn) IsValid() bool {
 	return c.Err == nil
 }
 
-func Example_openDBService() {
+func Example_openPoolService() {
 	log.SetFlags(log.Lshortfile | log.Ltime | log.Lmicroseconds)
 
 	connpool.Register("dialer-name", dialer.DialerFunc(func(network, address string) (net.Conn, error) {
